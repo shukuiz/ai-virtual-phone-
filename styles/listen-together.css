@@ -266,6 +266,41 @@
 .lt-bubble[data-user] .lt-bubble-name { display: none; }
 .lt-bubbles { bottom: 104px; }
 
+/* 发言失败：摘要与技术原因使用不同层级和颜色，默认不打断听歌。 */
+.lt-layer-error {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 5px 8px;
+    pointer-events: auto;
+    color: #ffb454;
+}
+.lt-layer-error .lt-error-summary { color: #ffb454; }
+.lt-error-detail-toggle {
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: #8ec5ff;
+    font: inherit;
+    font-size: 10px;
+    text-decoration: underline;
+    cursor: pointer;
+}
+.lt-error-detail {
+    flex: 0 0 100%;
+    max-height: 96px;
+    margin-top: 2px;
+    padding: 7px 9px;
+    overflow: auto;
+    border: 1px solid rgba(255, 120, 100, 0.28);
+    border-radius: 8px;
+    background: rgba(80, 20, 24, 0.72);
+    color: #ffb7a8;
+    font: 10px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
+
 /* 移动端面板：内容多时由面板内部滚动，避免底部按钮被裁掉。 */
 .lt-panel-mask { align-items: flex-start; justify-content: center; overflow-y: auto; padding: max(12px, var(--page-header-safe-top, 48px)) 14px 18px; box-sizing: border-box; }
 .lt-panel-official { box-sizing: border-box; width: min(390px, 100%); height: min(700px, calc(100dvh - var(--page-header-safe-top, 48px) - 18px)); max-height: none; min-height: 0; flex: 0 0 auto; overflow-y: auto; overscroll-behavior: contain; -webkit-overflow-scrolling: touch; padding-bottom: max(24px, env(safe-area-inset-bottom, 0px)); }
