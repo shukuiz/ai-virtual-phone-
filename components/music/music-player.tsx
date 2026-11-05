@@ -720,6 +720,7 @@ export default function MusicPlayer() {
                     isPlaying={player.isPlaying}
                     onNext={handleNext}
                     onExit={exitListenTogether}
+                    onBackToPlayer={() => setListenActive(false)}
                 />
             )}
 

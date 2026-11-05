@@ -37,7 +37,9 @@ export const PhoneChatApp = memo(function PhoneChatApp({ onClose, initialSession
     const [chatAppCSS, setChatAppCSS] = useState(() =>
         typeof window !== "undefined" ? kvGet("chat-app-custom-css") || "" : ""
     );
-    // Cache all visited sessions so their ChatRoom stays mounted (hidden)
+    // 只保留最近访问的少量会话，避免每打开一个会话就永久挂载一个隐藏 ChatRoom。
+    // 隐藏聊天室仍会运行事件监听、派生消息和异步状态，长期累积会拖慢收发消息。
+    const MAX_MOUNTED_CHAT_ROOMS = 2;
     const [visitedSessions, setVisitedSessions] = useState<Map<string, ChatSession>>(new Map());
     const [dbReady, setDbReady] = useState(false);
     const [hideTabBar, setHideTabBar] = useState(false);
@@ -136,9 +138,15 @@ export const PhoneChatApp = memo(function PhoneChatApp({ onClose, initialSession
         if (activeSession) {
             setActiveMascot(false);
             setVisitedSessions(prev => {
-                if (prev.has(activeSession.id)) return prev;
                 const next = new Map(prev);
+                // Map 的插入顺序作为最近访问顺序：命中时先移除再追加。
+                next.delete(activeSession.id);
                 next.set(activeSession.id, activeSession);
+                while (next.size > MAX_MOUNTED_CHAT_ROOMS) {
+                    const oldestId = next.keys().next().value as string | undefined;
+                    if (!oldestId || oldestId === activeSession.id) break;
+                    next.delete(oldestId);
+                }
                 return next;
             });
             // Push session info to mascot context so 小卷 can access sessionId

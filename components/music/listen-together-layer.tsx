@@ -12,6 +12,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { loadCharacters } from "@/lib/character-storage";
 import type { Character } from "@/lib/character-types";
 import type { MusicTrack } from "@/lib/music-storage";
+import { fileToCompressedDataUrl } from "@/lib/music-bg";
+import { resolveUserIdentity } from "@/lib/settings-storage";
 import {
     addListenDuration,
     appendListenHistory,
@@ -20,6 +22,13 @@ import {
     generateListenComment,
     generateListenReply,
     getRecentBubbleTexts,
+    getListenHistory,
+    getListenRelation,
+    formatListenDuration,
+    loadListenRoomBackground,
+    saveListenRoomBackground,
+    saveListenMemory,
+    summarizeListenSession,
     loadListenSession,
     markCommentLine,
     markSkipDenied,
@@ -46,6 +55,7 @@ type Props = {
     isPlaying: boolean;
     onNext: () => void;
     onExit: () => void;
+    onBackToPlayer: () => void;
 };
 
 type SkipVote = { characterId: string; characterName: string; reason: string };
@@ -55,7 +65,7 @@ function formatFailureDetail(value: unknown): string {
     return detail.trim() || "请求未返回可用的错误信息。";
 }
 
-export default function ListenTogetherLayer({ track, currentTime, isPlaying, onNext, onExit }: Props) {
+export default function ListenTogetherLayer({ track, currentTime, isPlaying, onNext, onExit, onBackToPlayer }: Props) {
     const [session, setSession] = useState<ListenSession>(() => loadListenSession());
     const [characters] = useState<Character[]>(() => loadCharacters());
     const [bubbles, setBubbles] = useState<ListenBubble[]>([]);
@@ -68,6 +78,17 @@ export default function ListenTogetherLayer({ track, currentTime, isPlaying, onN
     const [talkTo, setTalkTo] = useState<string | null>(null);
     const [draft, setDraft] = useState("");
     const [replying, setReplying] = useState(false);
+    const [typingId, setTypingId] = useState<string | null>(null);
+    const [pendingMemories, setPendingMemories] = useState<Awaited<ReturnType<typeof summarizeListenSession>>["pendingMemories"]>([]);
+    const [memoryBusy, setMemoryBusy] = useState(false);
+    const [memoryError, setMemoryError] = useState<string | null>(null);
+    const summaryStartedRef = useRef(false);
+    const [durationRefresh, setDurationRefresh] = useState(0);
+    const [endAfterMemory, setEndAfterMemory] = useState(false);
+    const [showRoomMenu, setShowRoomMenu] = useState(false);
+    const [userAvatar, setUserAvatar] = useState(() => resolveUserIdentity()?.avatarUrl || "");
+    const [roomBackground, setRoomBackground] = useState(() => loadListenRoomBackground(loadListenSession().characterIds[0] || ""));
+    const [showBackgroundPicker, setShowBackgroundPicker] = useState(false);
 
     // ── refs：调度器一律读 ref，避免闭包拿到旧值 ──
     const bubbleTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
@@ -143,6 +164,11 @@ export default function ListenTogetherLayer({ track, currentTime, isPlaying, onN
         };
     }, []);
 
+    useEffect(() => {
+        const timer = setInterval(() => setDurationRefresh(value => value + 1), 15_000);
+        return () => clearInterval(timer);
+    }, []);
+
     // ── 换歌：清空弹幕、重置冷却、记「陪听过一次」──
     useEffect(() => {
         setBubbles([]);
@@ -188,6 +214,8 @@ export default function ListenTogetherLayer({ track, currentTime, isPlaying, onN
         setDraft("");
         setReplying(true);
         const current = trackRef.current;
+        const typingBubbleId = `lt_typing_${Date.now()}`;
+        setTypingId(typingBubbleId);
         const userBubble: ListenBubble = {
             id: `lt_u_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
             characterId: "__user__",
@@ -201,14 +229,19 @@ export default function ListenTogetherLayer({ track, currentTime, isPlaying, onN
         try {
             const result = await generateListenReply({ character: target, track: current, userLabel: resolveUserLabel(target.id), userText: text, recentTexts: getRecentBubbleTexts(current.id) });
             if (!result.text) {
+                setTypingId(null);
                 reportFailure(result.error);
                 return;
             }
+            setTypingId(null);
             const reply = createBubble(target, result.text, "comment");
             appendListenHistory(current.id, reply);
             markCommentLine(target.id, current.id, result.text);
             clearFailure();
             if (mountedRef.current) pushBubble(reply);
+        } catch (error) {
+            setTypingId(null);
+            reportFailure(error instanceof Error ? error.message : String(error));
         } finally {
             if (mountedRef.current) setReplying(false);
         }
@@ -364,25 +397,58 @@ export default function ListenTogetherLayer({ track, currentTime, isPlaying, onN
         onExit();
     }, [onExit]);
 
+    const backToPlayer = useCallback(() => {
+        onBackToPlayer();
+    }, [onBackToPlayer]);
+
+    const finishAndSummarize = useCallback(async () => {
+        if (memoryBusy || summaryStartedRef.current) return;
+        summaryStartedRef.current = true;
+        setMemoryBusy(true);
+        setMemoryError(null);
+        try {
+            const result = await summarizeListenSession(roster[0]?.id || "", roster[0]?.name || "角色", trackRef.current, sessionRef.current.startedAt);
+            if (result.pendingMemories.length > 0) setPendingMemories(result.pendingMemories);
+            if (result.error) setMemoryError(result.error);
+        } catch (error) {
+            setMemoryError(error instanceof Error ? error.message : "记忆整理失败");
+        } finally {
+            setMemoryBusy(false);
+        }
+    }, [memoryBusy, roster]);
+
+    const confirmMemory = useCallback(async (id: string, accept: boolean) => {
+        const item = pendingMemories.find(memory => memory.id === id);
+        setPendingMemories(prev => prev.filter(memory => memory.id !== id));
+        if (accept && item && roster[0]) await saveListenMemory(roster[0].id, item);
+    }, [pendingMemories, roster]);
+
     if (!session.active || roster.length === 0) return null;
 
     const people = roster.length;
+    const roomBackgroundStyle = roomBackground?.image
+        ? { backgroundImage: `linear-gradient(rgba(8,9,14,${Math.max(0, Math.min(.9, roomBackground.dim / 100))}), rgba(8,9,14,${Math.max(0, Math.min(.9, roomBackground.dim / 100))})), url("${roomBackground.image}")`, backgroundSize: "cover", backgroundPosition: "center" as const }
+        : track.coverUrl ? { backgroundImage: `linear-gradient(rgba(8,9,14,.42), rgba(8,9,14,.42)), url("${track.coverUrl}")`, backgroundSize: "cover", backgroundPosition: "center" as const } : undefined;
 
     return (
-        <div className="lt-layer">
+        <div className="lt-layer" style={roomBackgroundStyle}>
             {/* 顶部状态条 */}
             <div className="lt-live-bar">
+                <button className="lt-room-back" onClick={backToPlayer} aria-label="返回播放器">‹</button>
                 <span className="lt-live-dot" />
-                <b>一起听</b>
-                <span className="lt-live-people">
-                    {roster.map(character => character.name || "角色").join("、")}
-                </span>
+                <div className="lt-room-title"><b>一起听</b><span>{roster.map(character => character.name || "角色").join("、")}</span></div>
+                <div className="lt-room-stats">
+                    <div className="lt-room-avatars"><span className="lt-room-avatar">{userAvatar ? <img src={userAvatar} alt="" /> : "我"}</span>{roster.slice(0, 1).map(character => <span className="lt-room-avatar" key={character.id}>{character.avatar ? <img src={character.avatar} alt="" /> : (character.name || "?").slice(0, 1)}</span>)}</div>
+                    <span>{formatListenDuration(getListenRelation(roster[0]?.id || "").listenedSeconds + durationRefresh * 0)} · {getListenRelation(roster[0]?.id || "").distanceKm === null ? "就在身边" : `${getListenRelation(roster[0]?.id || "").distanceKm} km`}</span>
+                </div>
                 <div className="lt-live-actions">
                     <button className="lt-live-btn" onClick={() => void runAll()} disabled={busy}>
                         {busy ? "说话中" : "一起评"}
                     </button>
-                    <button className="lt-live-btn" onClick={exit}>结束</button>
+                    <button className="lt-live-btn" onClick={() => setShowRoomMenu(prev => !prev)} aria-label="更多选项">···</button>
                 </div>
+                {showRoomMenu && <div className="lt-room-menu"><button onClick={() => void finishAndSummarize()} disabled={memoryBusy}>{memoryBusy ? "整理中…" : "结束并整理记忆"}</button><button onClick={() => setShowBackgroundPicker(prev => !prev)}>房间背景</button><button onClick={exit}>结束一起听</button></div>}
+                {showBackgroundPicker && <div className="lt-background-picker"><b>房间背景</b><button onClick={() => { setRoomBackground(null); saveListenRoomBackground(roster[0]?.id || "", null); }}>使用当前歌曲封面</button><label>上传图片<input type="file" accept="image/*" onChange={async event => { const file = event.target.files?.[0]; if (!file || !roster[0]) return; try { const image = await fileToCompressedDataUrl(file); const value = { image, dim: 42 }; setRoomBackground(value); saveListenRoomBackground(roster[0].id, value); } catch { setMemoryError("背景图片读取失败"); } }} /></label></div>}
             </div>
 
             {error && (
@@ -425,6 +491,20 @@ export default function ListenTogetherLayer({ track, currentTime, isPlaying, onN
                     );
                 })}
             </div>
+
+            {typingId && <div className="lt-typing-bubble"><span>{roster[0]?.name || "TA"} 正在输入</span><i /><i /><i /></div>}
+
+            {memoryError && <div className="lt-memory-error">{memoryError}</div>}
+            {pendingMemories.length > 0 && (
+                <div className="lt-memory-confirm-stack">
+                    {pendingMemories.map(memory => (
+                        <div className="lt-memory-confirm" key={memory.id}>
+                            <span>TA 想记住：{memory.content}</span>
+                            <div><button onClick={() => void confirmMemory(memory.id, true)}>是</button><button onClick={() => void confirmMemory(memory.id, false)}>否</button></div>
+                        </div>
+                    ))}
+                </div>
+            )}
 
             {/* 1v1 对话输入区：多人时可先点头像指定对象 */}
             <div className="lt-chat-bar">

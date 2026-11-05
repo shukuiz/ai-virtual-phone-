@@ -15,8 +15,10 @@ import { loadCharacterTaste, tasteToPromptBlock } from "./character-music-taste"
 import { kvGet, kvSet } from "./kv-db";
 import type { Character } from "./character-types";
 import type { MusicTrack } from "./music-storage";
-import { loadApiConfigs, loadBindingConfig, resolveBinding, resolveUserIdentity } from "./settings-storage";
+import { loadApiConfigs, loadBindingConfig, resolveAuxiliaryApiConfig, resolveBinding, resolveUserIdentity } from "./settings-storage";
 import { renderUserNameMacro } from "./user-macro";
+import { saveMemoryEntry } from "./memory-storage";
+import type { MemoryEntry } from "./memory-types";
 
 // ── 存储键 ─────────────────────────────────────────────
 // 全部走 kv-db（IndexedDB AiPhoneKvDB / entries，in-line key，value 是 JSON 字符串）。
@@ -25,6 +27,7 @@ const MOOD_KEY = "music-listen-together-mood-v1";         // 角色 × 歌 的�
 const SESSION_KEY = "music-listen-together-session-v1";   // 会话：是否开启 / 哪些角色 / 发言间隔
 const SELECTED_KEY = "music-listen-together-selected-v1"; // 上次勾选的角色
 const RELATION_KEY = "music-listen-together-relation-v1"; // 角色距离 / 累计时长 / 最近一起听
+const ROOM_BG_KEY = "music-listen-together-room-bg-v1"; // 角色专属一起听房间背景
 
 export type ListenRelation = {
     characterId: string;
@@ -34,6 +37,13 @@ export type ListenRelation = {
 };
 
 type ListenRelationStore = Record<string, ListenRelation>;
+export type ListenRoomBackground = { image: string; dim: number };
+export function loadListenRoomBackground(characterId: string): ListenRoomBackground | null {
+    try { const raw = kvGet(ROOM_BG_KEY); const store = raw ? JSON.parse(raw) : {}; const value = store?.[characterId]; return value && typeof value.image === "string" ? { image: value.image, dim: Math.max(0, Math.min(90, Number(value.dim) || 35)) } : null; } catch { return null; }
+}
+export function saveListenRoomBackground(characterId: string, value: ListenRoomBackground | null): void {
+    try { const raw = kvGet(ROOM_BG_KEY); const store = raw ? JSON.parse(raw) : {}; if (value) store[characterId] = value; else delete store[characterId]; kvSet(ROOM_BG_KEY, JSON.stringify(store)); } catch { /* ignore storage errors */ }
+}
 
 // ── 容量与预算 ─────────────────────────────────────────
 export const BUBBLE_MAX_CHARS = 80;       // 单条弹幕上限（出口截断）
@@ -84,6 +94,22 @@ export type ListenSession = {
 
 export type ListenCommentResult = { text: string | null; error?: string };
 export type ListenSkipDecision = { skip: boolean; reason: string; error?: string };
+
+export type ListenPendingMemory = {
+    id: string;
+    kind: "conversation" | "meaningful_song";
+    title: string;
+    content: string;
+    song?: { id: string; title: string; artist: string };
+    meaningType?: string;
+};
+
+export type ListenSessionSummary = {
+    conversationSummary: string;
+    songMemories: Array<{ songId: string; title: string; artist: string; story: string; emotionalMeaning: string; meaningType: string; userWords: string }>;
+    pendingMemories: ListenPendingMemory[];
+    error?: string;
+};
 
 // ── 会话 ───────────────────────────────────────────────
 
@@ -419,6 +445,11 @@ export function getListenHistory(trackId: string): ListenBubble[] {
     return loadHistoryStore()[trackId]?.bubbles ?? [];
 }
 
+export function getListenSessionHistory(startedAt: number): ListenBubble[] {
+    const all = Object.values(loadHistoryStore()).flatMap(entry => entry.bubbles || []);
+    return all.filter(item => !startedAt || item.at >= startedAt).sort((a, b) => a.at - b.at).slice(-100);
+}
+
 /**
  * 追加一条弹幕。
  * 新行为（点歌、接龙等）也必须写回历史——历史既是接话上下文，也是防复读的数据源，
@@ -431,6 +462,87 @@ export function appendListenHistory(trackId: string, bubble: ListenBubble): void
     const bubbles = [...entry.bubbles, bubble].slice(-HISTORY_PER_TRACK);
     store[trackId] = { bubbles, updatedAt: Date.now() };
     saveHistoryStore(store);
+}
+
+function parseJsonObject(raw: string): Record<string, unknown> | null {
+    const clean = raw.replace(/```json|```/gi, "");
+    const start = clean.indexOf("{");
+    const end = clean.lastIndexOf("}");
+    if (start < 0 || end <= start) return null;
+    try { return JSON.parse(clean.slice(start, end + 1)) as Record<string, unknown>; } catch { return null; }
+}
+
+function textField(value: unknown, max = 500): string {
+    return typeof value === "string" ? sanitizeListenText(value).slice(0, max) : "";
+}
+
+export async function summarizeListenSession(
+    characterId: string,
+    characterName: string,
+    track: MusicTrack,
+    startedAt: number,
+): Promise<ListenSessionSummary> {
+    const history = getListenSessionHistory(startedAt);
+    const userLines = history.filter(item => item.kind === "user");
+    const assistantLines = history.filter(item => item.kind !== "user");
+    if (history.length === 0) return { conversationSummary: "", songMemories: [], pendingMemories: [] };
+    const apiConfig = resolveAuxiliaryApiConfig("memorySummaryApiConfigId");
+    if (!apiConfig) return { conversationSummary: "", songMemories: [], pendingMemories: [], error: "未配置记忆总结 API" };
+    const transcript = history.slice(-50).map(item => `${item.kind === "user" ? "用户" : item.characterName}：${item.text}`).join("\n");
+    const prompt = [
+        "你是一起听会话的记忆整理器。一次调用同时完成对话总结和歌曲意义判断。",
+        `角色：${characterName || "角色"}`,
+        `歌曲：${track.title || "未知曲目"} / ${track.artist || "未知歌手"} / ID:${track.id}`,
+        `会话开始时间：${startedAt ? new Date(startedAt).toISOString() : "未知"}`,
+        "【对话记录】", transcript,
+        "【硬性规则】",
+        "1. conversationSummary 只总结用户明确表达且未来对话有帮助的内容；没有就留空。",
+        "2. meaningful song 只在用户明确说这首歌有特殊意义、或明确讲述它与人物、事件、地点、人生阶段、承诺或特殊经历有关时生成。",
+        "3. 不得把播放、收藏、循环、未切歌、歌词或角色猜测当成用户喜欢或特殊意义。",
+        "4. 不得编造人物、地点、日期、事件；不得把过去自动说成现在仍然成立。",
+        "5. 只输出 JSON，不要 Markdown。格式：",
+        '{"conversationSummary":"","songMemories":[{"songId":"","title":"","artist":"","story":"","emotionalMeaning":"","meaningType":"person|event|place|period|promise|comfort|identity|other","userWords":""}]}',
+    ].join("\n");
+    const result = await simpleLLMCall(apiConfig, [{ role: "user", content: prompt }], { temperature: 0.2, max_tokens: 4096, label: `一起听记忆·${characterName || "角色"}` });
+    if (result.error || !result.content) return { conversationSummary: "", songMemories: [], pendingMemories: [], error: result.error || "记忆总结没有返回内容" };
+    const parsed = parseJsonObject(result.content);
+    if (!parsed) return { conversationSummary: "", songMemories: [], pendingMemories: [], error: "记忆总结返回格式无法解析" };
+    const conversationSummary = textField(parsed.conversationSummary, 800);
+    const rawSongs = Array.isArray(parsed.songMemories) ? parsed.songMemories : [];
+    const songMemories = rawSongs.filter(item => item && typeof item === "object").map(item => {
+        const value = item as Record<string, unknown>;
+        return {
+            songId: typeof value.songId === "string" && value.songId ? value.songId : track.id,
+            title: textField(value.title, 120) || track.title,
+            artist: textField(value.artist, 120) || track.artist,
+            story: textField(value.story, 500),
+            emotionalMeaning: textField(value.emotionalMeaning, 240),
+            meaningType: textField(value.meaningType, 40) || "other",
+            userWords: textField(value.userWords, 240),
+        };
+    }).filter(item => item.story && item.userWords);
+    const pendingMemories: ListenPendingMemory[] = [];
+    if (conversationSummary) pendingMemories.push({ id: `listen_memory_${Date.now()}_summary`, kind: "conversation", title: "一起听对话总结", content: conversationSummary });
+    for (const item of songMemories) pendingMemories.push({ id: `listen_memory_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`, kind: "meaningful_song", title: `${item.title}的意义`, content: item.story, song: { id: item.songId, title: item.title, artist: item.artist }, meaningType: item.meaningType });
+    void userLines;
+    void assistantLines;
+    return { conversationSummary, songMemories, pendingMemories };
+}
+
+export async function saveListenMemory(characterId: string, memory: ListenPendingMemory): Promise<void> {
+    const now = new Date().toISOString();
+    const entry: MemoryEntry = {
+        id: memory.id,
+        characterId,
+        sourceApp: "music",
+        type: "long_term",
+        content: memory.content,
+        importance: memory.kind === "meaningful_song" ? 0.9 : 0.75,
+        createdAt: now,
+        updatedAt: now,
+        metadata: { listenMemoryKind: memory.kind, title: memory.title, song: memory.song, meaningType: memory.meaningType, source: "user_confirmed" },
+    };
+    await saveMemoryEntry(entry);
 }
 
 /** 最近几条弹幕文本，给接话和防复读用 */

@@ -2115,6 +2115,11 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
     // useLayoutEffect: runs synchronously after DOM mutation, before browser paint
     // Prevents flash of wrong scroll position, works reliably under transform: scale()
     const displayMessages = useMemo(() => {
+        // 持久化消息始终由 loadChatMessages / setMessages(prev => [...prev, msg])
+        // 按稳定 order 维护顺序。普通收发没有临时消息时直接复用数组，避免每次新增消息都
+        // 对整段历史重新 map + sort；只有临时消息需要插入时才走合并排序路径。
+        if (transientMessages.length === 0) return messages;
+
         return [...messages, ...transientMessages]
             .map((msg, index) => ({ msg, index }))
             .sort((a, b) => {
